@@ -44,7 +44,11 @@ def load_config(path: str) -> dict:
 def run_cycle(cfg: dict) -> None:
     src = cfg.get("source", {})
     ai_cfg = cfg.get("ai", {})
-    store = SeenStore(cfg.get("storage", {}).get("db_path", "state.db"))
+    # DB_PATH из окружения имеет приоритет над config.yaml —
+    # на Railway сюда указывают путь примонтированного volume (напр. /data/state.db)
+    db_path = os.environ.get("DB_PATH") or cfg.get("storage", {}).get("db_path", "state.db")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    store = SeenStore(db_path)
 
     try:
         # 1. Парсим площадку
