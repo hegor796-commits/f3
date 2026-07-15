@@ -85,7 +85,7 @@ def run_cycle(cfg: dict) -> None:
                 ai_filter.check_relevance(
                     matched,
                     interest_profile=ai_cfg.get("interest_profile", ""),
-                    model=ai_cfg.get("model", "claude-opus-4-8"),
+                    model=ai_cfg.get("model", "gpt-4o"),
                     max_checks=int(ai_cfg.get("max_checks_per_cycle", 20)),
                 )
                 # Без оценки (сбой API / лимит проверок) — отправляем,
@@ -99,7 +99,7 @@ def run_cycle(cfg: dict) -> None:
                     store.mark_seen(lst.listing_id, lst.title, notified=False, ai_score=lst.ai_score)
                 log.info("Прошло ИИ-фильтр (score >= %d): %d", min_score, len(to_notify))
             else:
-                log.warning("ANTHROPIC_API_KEY не задан — работаем без ИИ-фильтра")
+                log.warning("OPENAI_API_KEY не задан — работаем без ИИ-фильтра")
 
         # 5. Уведомления в Telegram
         for lst in to_notify:

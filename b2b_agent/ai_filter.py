@@ -1,7 +1,7 @@
-"""ИИ-оценка релевантности объявлений через Claude API.
+"""ИИ-оценка релевантности объявлений через OpenAI API.
 
 Каждое объявление, прошедшее фильтр по ключевым словам, отправляется
-в Claude вместе с профилем интересов пользователя. Модель возвращает
+в OpenAI вместе с профилем интересов пользователя. Модель возвращает
 структурированный ответ: оценку релевантности 0-10 и краткое резюме
 для уведомления.
 """
@@ -9,7 +9,7 @@
 import logging
 import os
 
-import anthropic
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .models import Listing
@@ -38,13 +38,13 @@ class RelevanceCheck(BaseModel):
 
 def is_available() -> bool:
     """Есть ли ключ API (иначе агент работает без ИИ-фильтра)."""
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    return bool(os.environ.get("OPENAI_API_KEY"))
 
 
 def check_relevance(
     listings: list[Listing],
     interest_profile: str,
-    model: str = "claude-opus-4-8",
+    model: str = "gpt-4o",
     max_checks: int = 20,
 ) -> list[Listing]:
     """Проставляет ai_score и ai_summary каждому объявлению.
@@ -53,7 +53,7 @@ def check_relevance(
     отправке принимает вызывающий код (по умолчанию отправляем, чтобы
     сбой ИИ не приводил к потере потенциально важных уведомлений).
     """
-    client = anthropic.Anthropic()
+    client = OpenAI()
 
     for lst in listings[:max_checks]:
         user_message = (
@@ -65,19 +65,21 @@ def check_relevance(
             f"Совпавшие ключевые слова: {', '.join(lst.matched_keywords)}"
         )
         try:
-            response = client.messages.parse(
+            response = client.beta.chat.completions.parse(
                 model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                response_format=RelevanceCheck,
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-                output_format=RelevanceCheck,
             )
-            parsed = response.parsed_output
+            parsed = response.choices[0].message.parsed
             lst.ai_score = parsed.score
             lst.ai_summary = parsed.summary
             log.info("ИИ-оценка %s: %d/10 — %s", lst.listing_id, parsed.score, lst.title[:60])
-        except anthropic.APIError as e:
-            log.warning("Ошибка Claude API для объявления %s: %s", lst.listing_id, e)
+        except Exception as e:
+            log.warning("Ошибка OpenAI API для объявления %s: %s", lst.listing_id, e)
 
     if len(listings) > max_checks:
         log.info(

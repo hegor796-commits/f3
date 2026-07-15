@@ -2,7 +2,7 @@
 
 Агент периодически парсит список торговых процедур на
 [b2b-center.ru](https://www.b2b-center.ru/market/), отбирает объявления
-по ключевым словам, оценивает их релевантность через Claude API и
+по ключевым словам, оценивает их релевантность через OpenAI API и
 присылает пуш-уведомления в Telegram.
 
 ## Как это работает
@@ -16,7 +16,7 @@ B2B-Center (парсинг) → фильтр по ключевым словам 
 - **ИИ-фильтр**: Claude сравнивает объявление с твоим «профилем интересов»
   из `config.yaml`, ставит оценку 0–10 и пишет краткое резюме прямо
   в уведомление. Формальные совпадения по словам (не по смыслу) отсекаются.
-- **Деградация без ИИ**: если `ANTHROPIC_API_KEY` не задан, агент работает
+- **Деградация без ИИ**: если `OPENAI_API_KEY` не задан, агент работает
   просто по ключевым словам.
 
 ## Установка
@@ -43,10 +43,10 @@ python -m b2b_agent get-chat-id
 python -m b2b_agent test-telegram
 ```
 
-### 2. (Опционально) Ключ Claude API
+### 2. (Опционально) Ключ OpenAI API
 
 Получи ключ на [platform.claude.com](https://platform.claude.com) и запиши
-в `.env` → `ANTHROPIC_API_KEY`.
+в `.env` → `OPENAI_API_KEY`.
 
 ### 3. Настрой config.yaml
 
@@ -109,7 +109,7 @@ WantedBy=multi-user.target
    |---|---|
    | `TELEGRAM_BOT_TOKEN` | токен бота от @BotFather |
    | `TELEGRAM_CHAT_ID`   | твой chat_id |
-   | `ANTHROPIC_API_KEY`  | ключ Claude API (если нужен ИИ-фильтр) |
+   | `OPENAI_API_KEY`  | ключ OpenAI API (если нужен ИИ-фильтр) |
    | `DB_PATH`            | `/data/state.db` (см. п.4) |
 
 4. **Постоянное хранилище (обязательно!)** У Railway диск контейнера стирается
@@ -170,7 +170,7 @@ WantedBy=multi-user.target
 b2b_agent/
   scraper.py    — парсинг списка торгов B2B-Center
   filters.py    — фильтр по ключевым словам
-  ai_filter.py  — оценка релевантности через Claude API
+  ai_filter.py  — оценка релевантности через OpenAI API
   notifier.py   — отправка уведомлений в Telegram
   state.py      — SQLite-хранилище обработанных объявлений
   main.py       — CLI и основной цикл
