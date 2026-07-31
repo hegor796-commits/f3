@@ -41,7 +41,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def run_cycle(cfg: dict) -> None:
+def run_cycle(cfg: dict) -> int:
     src = cfg.get("source", {})
     ai_cfg = cfg.get("ai", {})
     # DB_PATH из окружения имеет приоритет над config.yaml —
@@ -102,6 +102,7 @@ def run_cycle(cfg: dict) -> None:
                 log.warning("OPENAI_API_KEY не задан — работаем без ИИ-фильтра")
 
         # 5. Уведомления в Telegram
+        sent = 0
         for lst in to_notify:
             try:
                 notifier.send_message(
@@ -110,10 +111,12 @@ def run_cycle(cfg: dict) -> None:
                 )
                 store.mark_seen(lst.listing_id, lst.title, notified=True, ai_score=lst.ai_score)
                 log.info("Отправлено: %s", lst.title[:70])
+                sent += 1
                 time.sleep(1)
             except notifier.TelegramError as e:
                 # Не помечаем как seen — попробуем снова в следующем цикле
                 log.error("Не удалось отправить уведомление по %s: %s", lst.listing_id, e)
+        return sent
     finally:
         store.close()
 
@@ -142,12 +145,80 @@ def cmd_get_chat_id() -> None:
         print("\nВыбери нужный chat_id и запиши его в .env как TELEGRAM_CHAT_ID")
 
 
+def cmd_bot(cfg: dict) -> None:
+    """Режим бота: слушает команды в Telegram + периодически проверяет сам.
+
+    Команды:
+        /new  — прямо сейчас спарсить сайт и прислать новые тендеры
+        /help — краткая справка
+    """
+    interval = int(cfg.get("schedule", {}).get("interval_minutes", 30)) * 60
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    log.info("Запуск бота: команды /new, автопроверка каждые %d мин", interval // 60)
+    try:
+        notifier.send_message(
+            "🤖 Бот запущен. Отправь /new чтобы получить свежие тендеры прямо сейчас."
+        )
+    except notifier.TelegramError as e:
+        log.error("Не удалось отправить приветствие: %s", e)
+
+    last_run = 0.0
+    offset: int | None = None
+
+    while True:
+        # Периодическая автопроверка
+        if time.time() - last_run >= interval:
+            try:
+                run_cycle(cfg)
+            except Exception:
+                log.exception("Ошибка автоцикла — продолжаем работу")
+            last_run = time.time()
+
+        # Слушаем команды из Telegram (long polling)
+        updates = notifier.get_updates(offset, timeout=30)
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or {}
+            text = (msg.get("text") or "").strip()
+            from_chat = str(msg.get("chat", {}).get("id", ""))
+
+            # Реагируем только на свой чат
+            if chat_id and from_chat != chat_id:
+                continue
+
+            if text.startswith("/new") or text.startswith("/start"):
+                try:
+                    notifier.send_message("🔍 Проверяю сайт, подожди…")
+                    sent = run_cycle(cfg)
+                    last_run = time.time()
+                    if sent == 0:
+                        notifier.send_message("✅ Новых тендеров нет.")
+                    else:
+                        notifier.send_message(f"✅ Готово, отправил {sent} шт.")
+                except Exception as e:
+                    log.exception("Ошибка обработки /new")
+                    try:
+                        notifier.send_message(f"⚠️ Ошибка: {e}")
+                    except notifier.TelegramError:
+                        pass
+            elif text.startswith("/help"):
+                notifier.send_message(
+                    "Команды:\n"
+                    "/new — получить свежие тендеры прямо сейчас\n"
+                    "/help — эта справка\n\n"
+                    f"Бот и сам проверяет сайт каждые {interval // 60} мин "
+                    "и присылает только новые объявления."
+                )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ИИ-агент мониторинга B2B-Center")
     parser.add_argument(
         "command",
-        choices=["once", "run", "test-telegram", "get-chat-id"],
+        choices=["once", "run", "bot", "test-telegram", "get-chat-id"],
         help="once — один цикл; run — бесконечный цикл; "
+        "bot — слушать команды /new в Telegram + автопроверка; "
         "test-telegram — тест уведомления; get-chat-id — узнать chat_id",
     )
     parser.add_argument("--config", default="config.yaml", help="Путь к config.yaml")
@@ -172,6 +243,10 @@ def main() -> None:
 
     if args.command == "once":
         run_cycle(cfg)
+        return
+
+    if args.command == "bot":
+        cmd_bot(cfg)
         return
 
     interval = int(cfg.get("schedule", {}).get("interval_minutes", 30)) * 60

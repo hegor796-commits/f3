@@ -77,6 +77,23 @@ def send_message(text: str, parse_mode: str = "HTML", retries: int = 3) -> None:
             time.sleep(2 ** (attempt + 1))
 
 
+def get_updates(offset: int | None = None, timeout: int = 30) -> list[dict]:
+    """Читает новые сообщения боту (long polling). Возвращает список updates."""
+    token, _ = _credentials()
+    url = API_URL.format(token=token, method="getUpdates")
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        resp = requests.get(url, params=params, timeout=timeout + 10)
+        data = resp.json()
+        if data.get("ok"):
+            return data.get("result", [])
+    except requests.RequestException as e:
+        log.warning("Ошибка чтения обновлений Telegram: %s", e)
+    return []
+
+
 def notify(listings: list[Listing], parse_mode: str = "HTML") -> int:
     """Отправляет уведомление по каждому объявлению. Возвращает число отправленных."""
     sent = 0
