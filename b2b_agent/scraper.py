@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.b2b-center.ru"
 API_URL = "https://www.b2b-center.ru/site/api/v1/market_for_me/main_page/participant/"
+LOGIN_URL = "https://www.b2b-center.ru/auth/credentials_ajax_login.html"
+AUTH_URL = "https://www.b2b-center.ru/auth/openid/authorize/"
 TOKEN_URL = "https://www.b2b-center.ru/auth/openid/token/"
 CLIENT_ID = "5d438a01-eda7-4a88-9a68-a21f3ce3d4b0"
 VIEW_LINK_RE = re.compile(r"/market/view\.html\?id=(\d+)|/app/market/.+/tender-(\d+)/")
@@ -33,45 +35,84 @@ class ScrapeError(Exception):
     pass
 
 
-def _build_session() -> requests.Session:
-    session = requests.Session()
-    cookies_str = os.environ.get("B2B_COOKIES", "")
-    if cookies_str:
-        for part in cookies_str.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                session.cookies.set(name.strip(), value.strip(), domain="b2b-center.ru")
-    return session
+def _login(session: requests.Session, login: str, password: str) -> bool:
+    """Авторизуется на сайте через логин и пароль."""
+    try:
+        # Шаг 1: получаем страницу логина чтобы забрать CSRF токен
+        auth_params = {
+            "client_id": CLIENT_ID,
+            "redirect_uri": "https://www.b2b-center.ru/app/next/main/",
+            "response_type": "code",
+            "scope": "openid",
+            "response_mode": "query",
+        }
+        resp = session.get(AUTH_URL, params=auth_params, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml",
+        }, timeout=30)
+
+        # Ищем CSRF токен в HTML
+        csrf_match = re.search(r'name="login_form\[CSRFToken\]"\s+value="([^"]+)"', resp.text)
+        mfp_match = re.search(r'name="login_form\[MFPToken\]"\s+value="([^"]+)"', resp.text)
+
+        if not csrf_match:
+            log.warning("CSRF токен не найден на странице входа")
+            return False
+
+        csrf_token = csrf_match.group(1)
+        mfp_token = mfp_match.group(1) if mfp_match else ""
+
+        # Шаг 2: отправляем логин и пароль
+        login_data = {
+            "login_form[CSRFToken]": csrf_token,
+            "login_form[location_form]": "form_with_error_page",
+            "login_form[MFPToken]": mfp_token,
+            "login_form[login]": login,
+            "login_form[password]": password,
+        }
+        login_resp = session.post(LOGIN_URL, data=login_data, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "application/json, text/javascript, */*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": resp.url,
+        }, timeout=30)
+
+        result = login_resp.json()
+        if result.get("status") == "ok" or result.get("redirect"):
+            log.info("Авторизация на B2B-Center успешна")
+            return True
+        else:
+            log.warning("Ошибка авторизации: %s", result)
+            return False
+
+    except Exception as e:
+        log.warning("Ошибка при авторизации: %s", e)
+        return False
 
 
 def _get_access_token(session: requests.Session) -> str | None:
-    """Получает access_token через silent auth используя куки сессии."""
+    """Получает access_token через silent auth после логина."""
     try:
-        # Шаг 1: получаем authorization code через silent auth
-        auth_url = "https://www.b2b-center.ru/auth/openid/authorize/"
         params = {
-            "response_type": "code",
             "client_id": CLIENT_ID,
             "redirect_uri": "https://www.b2b-center.ru/app/next/silent-auth/",
+            "response_type": "code",
             "scope": "openid",
             "prompt": "none",
         }
-        resp = session.get(auth_url, params=params, headers={
+        resp = session.get(AUTH_URL, params=params, headers={
             "User-Agent": HEADERS["User-Agent"],
             "Accept": "text/html,application/xhtml+xml",
         }, allow_redirects=False, timeout=15)
 
-        # Ожидаем редирект с кодом
         location = resp.headers.get("Location", "")
         code_match = re.search(r"[?&]code=([^&]+)", location)
         if not code_match:
-            log.warning("Не удалось получить code из редиректа: %s", location[:200])
+            log.warning("Не удалось получить code: %s", location[:200])
             return None
 
         code = code_match.group(1)
 
-        # Шаг 2: меняем code на access_token
         token_resp = session.post(TOKEN_URL, data={
             "grant_type": "authorization_code",
             "code": code,
@@ -82,12 +123,9 @@ def _get_access_token(session: requests.Session) -> str | None:
             "Content-Type": "application/x-www-form-urlencoded",
         }, timeout=15)
 
-        token_data = token_resp.json()
-        token = token_data.get("access_token")
+        token = token_resp.json().get("access_token")
         if token:
-            log.info("Bearer токен успешно обновлён")
-        else:
-            log.warning("Токен не получен: %s", token_data)
+            log.info("Bearer токен успешно получен")
         return token
 
     except Exception as e:
@@ -107,17 +145,21 @@ def scrape_market(
     pages: int = 1,
     request_delay: float = 3.0,
 ) -> list[Listing]:
-    session = _build_session()
+    session = requests.Session()
 
-    # Получаем свежий токен автоматически
+    # Авторизуемся через логин/пароль
+    login = os.environ.get("B2B_LOGIN", "")
+    password = os.environ.get("B2B_PASSWORD", "")
+
+    if login and password:
+        _login(session, login, password)
+    else:
+        log.warning("B2B_LOGIN или B2B_PASSWORD не заданы — работаем без авторизации")
+
+    # Получаем Bearer токен
     token = _get_access_token(session)
     if not token:
-        # Fallback на токен из .env если автополучение не сработало
-        token = os.environ.get("B2B_BEARER", "")
-        if token:
-            log.info("Используем Bearer токен из .env")
-        else:
-            log.warning("Bearer токен недоступен — запросы могут вернуть 401")
+        log.warning("Bearer токен недоступен — запросы могут вернуть 401")
 
     api_headers = {**HEADERS}
     if token:
