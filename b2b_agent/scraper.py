@@ -6,6 +6,7 @@
 """
 
 import logging
+import os
 import re
 import time
 from urllib.parse import urljoin
@@ -27,6 +28,7 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+    "Referer": "https://www.b2b-center.ru/",
 }
 
 
@@ -39,6 +41,19 @@ def fetch_page(url: str, session: requests.Session, timeout: int = 30) -> str:
     if resp.status_code != 200:
         raise ScrapeError(f"HTTP {resp.status_code} for {url}")
     return resp.text
+
+
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    cookies_str = os.environ.get("B2B_COOKIES", "")
+    if cookies_str:
+        for part in cookies_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, _, value = part.partition("=")
+                session.cookies.set(name.strip(), value.strip(), domain="b2b-center.ru")
+        log.info("Используем куки авторизации B2B-Center")
+    return session
 
 
 def _parse_table_rows(soup: BeautifulSoup) -> list[Listing]:
@@ -103,7 +118,7 @@ def scrape_market(
     Пагинация B2B-Center: /market/?from=20, /market/?from=40 ...
     (по 20 позиций на страницу).
     """
-    session = requests.Session()
+    session = _build_session()
     all_listings: list[Listing] = []
     seen_ids: set[str] = set()
 
