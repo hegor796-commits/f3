@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.b2b-center.ru"
 API_URL = "https://www.b2b-center.ru/site/api/v1/market_for_me/main_page/participant/"
+TOKEN_URL = "https://www.b2b-center.ru/auth/openid/token/"
+CLIENT_ID = "5d438a01-eda7-4a88-9a68-a21f3ce3d4b0"
 VIEW_LINK_RE = re.compile(r"/market/view\.html\?id=(\d+)|/app/market/.+/tender-(\d+)/")
 
 HEADERS = {
@@ -40,14 +42,57 @@ def _build_session() -> requests.Session:
             if "=" in part:
                 name, _, value = part.partition("=")
                 session.cookies.set(name.strip(), value.strip(), domain="b2b-center.ru")
-        log.info("Используем куки авторизации B2B-Center")
-
-    bearer = os.environ.get("B2B_BEARER", "")
-    if bearer:
-        session.headers.update({"Authorization": f"Bearer {bearer}"})
-        log.info("Используем Bearer токен B2B-Center")
-
     return session
+
+
+def _get_access_token(session: requests.Session) -> str | None:
+    """Получает access_token через silent auth используя куки сессии."""
+    try:
+        # Шаг 1: получаем authorization code через silent auth
+        auth_url = "https://www.b2b-center.ru/auth/openid/authorize/"
+        params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": "https://www.b2b-center.ru/app/next/silent-auth/",
+            "scope": "openid",
+            "prompt": "none",
+        }
+        resp = session.get(auth_url, params=params, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml",
+        }, allow_redirects=False, timeout=15)
+
+        # Ожидаем редирект с кодом
+        location = resp.headers.get("Location", "")
+        code_match = re.search(r"[?&]code=([^&]+)", location)
+        if not code_match:
+            log.warning("Не удалось получить code из редиректа: %s", location[:200])
+            return None
+
+        code = code_match.group(1)
+
+        # Шаг 2: меняем code на access_token
+        token_resp = session.post(TOKEN_URL, data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://www.b2b-center.ru/app/next/silent-auth/",
+            "client_id": CLIENT_ID,
+        }, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Content-Type": "application/x-www-form-urlencoded",
+        }, timeout=15)
+
+        token_data = token_resp.json()
+        token = token_data.get("access_token")
+        if token:
+            log.info("Bearer токен успешно обновлён")
+        else:
+            log.warning("Токен не получен: %s", token_data)
+        return token
+
+    except Exception as e:
+        log.warning("Ошибка получения токена: %s", e)
+        return None
 
 
 def _extract_id(url: str) -> str | None:
@@ -63,6 +108,21 @@ def scrape_market(
     request_delay: float = 3.0,
 ) -> list[Listing]:
     session = _build_session()
+
+    # Получаем свежий токен автоматически
+    token = _get_access_token(session)
+    if not token:
+        # Fallback на токен из .env если автополучение не сработало
+        token = os.environ.get("B2B_BEARER", "")
+        if token:
+            log.info("Используем Bearer токен из .env")
+        else:
+            log.warning("Bearer токен недоступен — запросы могут вернуть 401")
+
+    api_headers = {**HEADERS}
+    if token:
+        api_headers["Authorization"] = f"Bearer {token}"
+
     all_listings: list[Listing] = []
     seen_ids: set[str] = set()
 
@@ -73,7 +133,7 @@ def scrape_market(
             "buy_sell": "buy",
         }
         try:
-            resp = session.get(API_URL, headers=HEADERS, params=params, timeout=30)
+            resp = session.get(API_URL, headers=api_headers, params=params, timeout=30)
             if resp.status_code != 200:
                 log.warning("API вернул статус %d на странице %d", resp.status_code, page + 1)
                 break
@@ -92,14 +152,12 @@ def scrape_market(
             url = trade.get("url", "")
             listing_id = _extract_id(url)
             if not listing_id:
-                # используем sphinx_id как запасной вариант
                 listing_id = str(trade.get("sphinx_id", ""))
             if not listing_id or listing_id in seen_ids:
                 continue
             seen_ids.add(listing_id)
 
             full_url = urljoin(BASE_URL, url) if url.startswith("/") else url
-            # очищаем HTML-сущности в названии
             title = re.sub(r"&nbsp;?", " ", trade.get("title", "")).strip()
             description = re.sub(r"&nbsp;?", " ", trade.get("description", "")).strip()
             company = trade.get("org_name_short", "")
