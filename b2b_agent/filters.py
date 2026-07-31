@@ -17,7 +17,7 @@ def keyword_filter(
 
     result: list[Listing] = []
     for lst in listings:
-        haystack = f"{lst.title} {lst.company}".lower()
+        haystack = f"{lst.title} {lst.company} {lst.description}".lower()
 
         if any(ex in haystack for ex in excludes_lower):
             continue

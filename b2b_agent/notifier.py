@@ -33,6 +33,9 @@ def format_message(lst: Listing) -> str:
     lines = [f"🔔 <b>{title}</b>"]
     if lst.company:
         lines.append(f"🏢 {html.escape(lst.company)}")
+    if lst.description:
+        snippet = lst.description[:300] + ("…" if len(lst.description) > 300 else "")
+        lines.append(f"📋 {html.escape(snippet)}")
     if lst.end_date:
         lines.append(f"⏳ Срок: {html.escape(lst.end_date)}")
     if lst.ai_score is not None:

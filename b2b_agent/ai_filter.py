@@ -60,6 +60,7 @@ def check_relevance(
             f"Профиль интересов пользователя:\n{interest_profile.strip()}\n\n"
             f"Объявление:\n"
             f"Название: {lst.title}\n"
+            f"Описание: {lst.description or 'не указано'}\n"
             f"Организатор: {lst.company or 'не указан'}\n"
             f"Срок: {lst.end_date or 'не указан'}\n"
             f"Совпавшие ключевые слова: {', '.join(lst.matched_keywords)}"
