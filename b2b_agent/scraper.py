@@ -51,9 +51,9 @@ def _login(session: requests.Session, login: str, password: str) -> bool:
             "Accept": "text/html,application/xhtml+xml",
         }, timeout=30)
 
-        # Ищем CSRF токен в HTML
-        csrf_match = re.search(r'name="login_form\[CSRFToken\]"\s+value="([^"]+)"', resp.text)
-        mfp_match = re.search(r'name="login_form\[MFPToken\]"\s+value="([^"]+)"', resp.text)
+        # Ищем CSRF токен в HTML (между name и value могут быть другие атрибуты)
+        csrf_match = re.search(r'name="login_form\[CSRFToken\]"[^>]*?value="([^"]+)"', resp.text)
+        mfp_match = re.search(r'name="login_form\[MFPToken\]"[^>]*?value="([^"]+)"', resp.text)
 
         if not csrf_match:
             log.warning("CSRF токен не найден на странице входа")
