@@ -48,8 +48,23 @@ def format_message(lst: Listing) -> str:
     return "\n".join(lines)
 
 
-def send_message(text: str, parse_mode: str = "HTML", retries: int = 3) -> None:
-    token, chat_id = _credentials()
+def _token() -> str:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise TelegramError("Не задан TELEGRAM_BOT_TOKEN (см. .env.example)")
+    return token
+
+
+def send_message(
+    text: str,
+    parse_mode: str = "HTML",
+    retries: int = 3,
+    chat_id: str | None = None,
+    reply_markup: dict | None = None,
+) -> None:
+    token = _token()
+    if chat_id is None:
+        _, chat_id = _credentials()
     url = API_URL.format(token=token, method="sendMessage")
     payload = {
         "chat_id": chat_id,
@@ -57,6 +72,8 @@ def send_message(text: str, parse_mode: str = "HTML", retries: int = 3) -> None:
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
 
     for attempt in range(retries):
         try:
@@ -75,6 +92,16 @@ def send_message(text: str, parse_mode: str = "HTML", retries: int = 3) -> None:
             if attempt == retries - 1:
                 raise TelegramError(f"Сетевая ошибка Telegram: {e}") from e
             time.sleep(2 ** (attempt + 1))
+
+
+def answer_callback(callback_id: str, text: str = "") -> None:
+    """Подтверждает нажатие inline-кнопки (убирает 'часики' у кнопки)."""
+    try:
+        token = _token()
+        url = API_URL.format(token=token, method="answerCallbackQuery")
+        requests.post(url, json={"callback_query_id": callback_id, "text": text}, timeout=15)
+    except (requests.RequestException, TelegramError):
+        pass
 
 
 def get_updates(offset: int | None = None, timeout: int = 30) -> list[dict]:

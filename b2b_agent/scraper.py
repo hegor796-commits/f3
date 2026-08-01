@@ -148,25 +148,28 @@ def _parse_search_page(html: str) -> list[Listing]:
     return listings
 
 
-def scrape_market(
-    market_url: str = SEARCH_URL,
-    pages: int = 3,
-    request_delay: float = 3.0,
-    search_queries: list[str] | None = None,
-) -> list[Listing]:
-    """Ищет торги по каждому слову из search_queries и собирает результаты."""
+def build_logged_session() -> requests.Session:
+    """Создаёт сессию и логинится на B2B-Center (один раз на цикл)."""
     session = requests.Session()
-
     login = os.environ.get("B2B_LOGIN", "")
     password = os.environ.get("B2B_PASSWORD", "")
     if login and password:
         _login(session, login, password)
     else:
         log.warning("B2B_LOGIN или B2B_PASSWORD не заданы — авторизация пропущена")
+    return session
 
+
+def search_listings(
+    session: requests.Session,
+    search_queries: list[str],
+    pages: int = 3,
+    request_delay: float = 3.0,
+) -> list[Listing]:
+    """Ищет торги по словам в готовой (залогиненной) сессии."""
     queries = [q for q in (search_queries or []) if q.strip()]
     if not queries:
-        log.warning("Не заданы слова для поиска (search_queries) — нечего искать")
+        log.warning("Не заданы слова для поиска — нечего искать")
         return []
 
     all_listings: list[Listing] = []
@@ -214,3 +217,14 @@ def scrape_market(
             time.sleep(request_delay)
 
     return all_listings
+
+
+def scrape_market(
+    market_url: str = SEARCH_URL,
+    pages: int = 3,
+    request_delay: float = 3.0,
+    search_queries: list[str] | None = None,
+) -> list[Listing]:
+    """Обёртка для режимов once/run: логин + поиск в одной функции."""
+    session = build_logged_session()
+    return search_listings(session, search_queries or [], pages, request_delay)

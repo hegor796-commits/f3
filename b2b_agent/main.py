@@ -10,6 +10,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -17,8 +18,8 @@ from pathlib import Path
 import requests
 import yaml
 
-from . import ai_filter, filters, notifier, scraper
-from .state import SeenStore
+from . import ai_filter, notifier, scraper
+from .state import Store
 
 log = logging.getLogger("b2b_agent")
 
@@ -41,83 +42,84 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def run_cycle(cfg: dict) -> int:
-    src = cfg.get("source", {})
-    ai_cfg = cfg.get("ai", {})
-    # DB_PATH из окружения имеет приоритет над config.yaml —
-    # на Railway сюда указывают путь примонтированного volume (напр. /data/state.db)
+def _open_store(cfg: dict) -> Store:
     db_path = os.environ.get("DB_PATH") or cfg.get("storage", {}).get("db_path", "state.db")
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    store = SeenStore(db_path)
+    return Store(db_path)
 
+
+def process_for_user(
+    cfg: dict,
+    store: Store,
+    session,
+    chat_id: str,
+    queries: list[str],
+) -> int:
+    """Ищет тендеры по словам пользователя, шлёт ему новые. Возвращает число отправленных."""
+    src = cfg.get("source", {})
+    ai_cfg = cfg.get("ai", {})
+    parse_mode = cfg.get("telegram", {}).get("parse_mode", "HTML")
+
+    listings = scraper.search_listings(
+        session,
+        queries,
+        pages=int(src.get("pages", 1)),
+        request_delay=float(src.get("request_delay", 3)),
+    )
+
+    # Только те, что этому пользователю ещё не слали
+    fresh = [lst for lst in listings if not store.is_seen(chat_id, lst.listing_id)]
+
+    # Отсеиваем слова-исключения (сам поиск на сайте уже отобрал по словам)
+    excludes = [e.lower() for e in cfg.get("exclude_keywords", []) if e.strip()]
+    matched = []
+    for lst in fresh:
+        haystack = f"{lst.title} {lst.company} {lst.description}".lower()
+        if any(ex in haystack for ex in excludes):
+            store.mark_seen(chat_id, lst.listing_id, lst.title)
+            continue
+        lst.matched_keywords = queries
+        matched.append(lst)
+
+    # ИИ-оценка (если доступна)
+    to_notify = matched
+    if matched and ai_cfg.get("enabled", True) and ai_filter.is_available():
+        min_score = int(ai_cfg.get("min_score", 6))
+        ai_filter.check_relevance(
+            matched,
+            interest_profile=ai_cfg.get("interest_profile", ""),
+            model=ai_cfg.get("model", "gpt-4o"),
+            max_checks=int(ai_cfg.get("max_checks_per_cycle", 20)),
+        )
+        to_notify = [l for l in matched if l.ai_score is None or l.ai_score >= min_score]
+        for l in matched:
+            if l not in to_notify:
+                store.mark_seen(chat_id, l.listing_id, l.title)
+
+    sent = 0
+    for lst in to_notify:
+        try:
+            notifier.send_message(
+                notifier.format_message(lst), parse_mode=parse_mode, chat_id=chat_id
+            )
+            store.mark_seen(chat_id, lst.listing_id, lst.title)
+            sent += 1
+            time.sleep(1)
+        except notifier.TelegramError as e:
+            log.error("Не удалось отправить %s пользователю %s: %s", lst.listing_id, chat_id, e)
+    if sent:
+        log.info("Пользователю %s отправлено: %d", chat_id, sent)
+    return sent
+
+
+def run_cycle(cfg: dict) -> int:
+    """Один цикл для режимов once/run — по chat_id из .env и словам из конфига."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    queries = cfg.get("source", {}).get("search_queries", [])
+    store = _open_store(cfg)
     try:
-        # 1. Парсим площадку
-        listings = scraper.scrape_market(
-            market_url=src.get("market_url", "https://www.b2b-center.ru/market/"),
-            pages=int(src.get("pages", 1)),
-            request_delay=float(src.get("request_delay", 3)),
-            search_queries=src.get("search_queries", []),
-        )
-        log.info("Собрано объявлений: %d", len(listings))
-
-        # 2. Отбрасываем уже виденные
-        fresh = [lst for lst in listings if not store.is_seen(lst.listing_id)]
-        log.info("Новых (не виденных ранее): %d", len(fresh))
-
-        # 3. Фильтр по ключевым словам
-        matched = filters.keyword_filter(
-            fresh,
-            keywords=cfg.get("keywords", []),
-            exclude_keywords=cfg.get("exclude_keywords", []),
-        )
-        log.info("Прошло фильтр по ключевым словам: %d", len(matched))
-
-        # Всё, что не прошло фильтр, помечаем как виденное без уведомления
-        matched_ids = {lst.listing_id for lst in matched}
-        for lst in fresh:
-            if lst.listing_id not in matched_ids:
-                store.mark_seen(lst.listing_id, lst.title, notified=False)
-
-        # 4. ИИ-оценка релевантности
-        to_notify = matched
-        if matched and ai_cfg.get("enabled", True):
-            if ai_filter.is_available():
-                min_score = int(ai_cfg.get("min_score", 6))
-                ai_filter.check_relevance(
-                    matched,
-                    interest_profile=ai_cfg.get("interest_profile", ""),
-                    model=ai_cfg.get("model", "gpt-4o"),
-                    max_checks=int(ai_cfg.get("max_checks_per_cycle", 20)),
-                )
-                # Без оценки (сбой API / лимит проверок) — отправляем,
-                # чтобы не потерять потенциально важное
-                to_notify = [
-                    lst for lst in matched
-                    if lst.ai_score is None or lst.ai_score >= min_score
-                ]
-                rejected = [lst for lst in matched if lst not in to_notify]
-                for lst in rejected:
-                    store.mark_seen(lst.listing_id, lst.title, notified=False, ai_score=lst.ai_score)
-                log.info("Прошло ИИ-фильтр (score >= %d): %d", min_score, len(to_notify))
-            else:
-                log.warning("OPENAI_API_KEY не задан — работаем без ИИ-фильтра")
-
-        # 5. Уведомления в Telegram
-        sent = 0
-        for lst in to_notify:
-            try:
-                notifier.send_message(
-                    notifier.format_message(lst),
-                    parse_mode=cfg.get("telegram", {}).get("parse_mode", "HTML"),
-                )
-                store.mark_seen(lst.listing_id, lst.title, notified=True, ai_score=lst.ai_score)
-                log.info("Отправлено: %s", lst.title[:70])
-                sent += 1
-                time.sleep(1)
-            except notifier.TelegramError as e:
-                # Не помечаем как seen — попробуем снова в следующем цикле
-                log.error("Не удалось отправить уведомление по %s: %s", lst.listing_id, e)
-        return sent
+        session = scraper.build_logged_session()
+        return process_for_user(cfg, store, session, chat_id, queries)
     finally:
         store.close()
 
@@ -146,71 +148,148 @@ def cmd_get_chat_id() -> None:
         print("\nВыбери нужный chat_id и запиши его в .env как TELEGRAM_CHAT_ID")
 
 
-def cmd_bot(cfg: dict) -> None:
-    """Режим бота: слушает команды в Telegram + периодически проверяет сам.
+def _main_menu() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "🔍 Показать новые тендеры", "callback_data": "show_new"}],
+            [{"text": "✏️ Задать слова поиска", "callback_data": "set_keywords"}],
+            [{"text": "📋 Мои слова", "callback_data": "my_keywords"}],
+            [{"text": "🔔 Слова по умолчанию", "callback_data": "reset_keywords"}],
+            [{"text": "⏸ Отписаться", "callback_data": "unsubscribe"}],
+        ]
+    }
 
-    Команды:
-        /new  — прямо сейчас спарсить сайт и прислать новые тендеры
-        /help — краткая справка
-    """
-    interval = int(cfg.get("schedule", {}).get("interval_minutes", 30)) * 60
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-    log.info("Запуск бота: команды /new, автопроверка каждые %d мин", interval // 60)
+WELCOME = (
+    "🤖 <b>Бот мониторинга тендеров B2B-Center</b>\n\n"
+    "Я каждые 30 минут ищу новые тендеры и присылаю тебе (без повторов).\n\n"
+    "По умолчанию ищу по словам, заданным администратором. Хочешь свои — "
+    "нажми «✏️ Задать слова поиска» и напиши их через запятую.\n\n"
+    "Выбери действие:"
+)
+
+
+def _do_show_new(cfg: dict, store: Store, chat_id: str, default_queries: list[str]) -> None:
+    store.add_user(chat_id)
+    queries = store.get_keywords(chat_id) or default_queries
     try:
-        notifier.send_message(
-            "🤖 Бот запущен. Отправь /new чтобы получить свежие тендеры прямо сейчас."
-        )
-    except notifier.TelegramError as e:
-        log.error("Не удалось отправить приветствие: %s", e)
+        notifier.send_message("🔍 Проверяю сайт, подожди…", chat_id=chat_id)
+        session = scraper.build_logged_session()
+        sent = process_for_user(cfg, store, session, chat_id, queries)
+        tail = f"✅ Готово, отправил {sent} шт." if sent else "✅ Новых тендеров нет."
+        notifier.send_message(tail, chat_id=chat_id, reply_markup=_main_menu())
+    except Exception as e:
+        log.exception("Ошибка show_new для %s", chat_id)
+        notifier.send_message(f"⚠️ Ошибка: {e}", chat_id=chat_id)
 
+
+def _handle_message(cfg, store, msg, awaiting, default_queries) -> None:
+    text = (msg.get("text") or "").strip()
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    if not chat_id:
+        return
+
+    # Пользователь вводит свои ключевые слова
+    if awaiting.pop(chat_id, False):
+        words = [w.strip() for w in re.split(r"[,\n;]+", text) if w.strip()]
+        if words:
+            store.set_keywords(chat_id, words)
+            notifier.send_message(
+                f"✅ Буду искать по словам: <b>{', '.join(words)}</b>",
+                chat_id=chat_id,
+            )
+            _do_show_new(cfg, store, chat_id, default_queries)
+        else:
+            notifier.send_message("Не понял слова, попробуй ещё раз.", chat_id=chat_id,
+                                  reply_markup=_main_menu())
+        return
+
+    if text.startswith("/start"):
+        store.add_user(chat_id)
+        notifier.send_message(WELCOME, chat_id=chat_id, reply_markup=_main_menu())
+    elif text.startswith("/new"):
+        _do_show_new(cfg, store, chat_id, default_queries)
+    elif text.startswith("/help"):
+        notifier.send_message(WELCOME, chat_id=chat_id, reply_markup=_main_menu())
+    else:
+        store.add_user(chat_id)
+        notifier.send_message("Выбери действие:", chat_id=chat_id, reply_markup=_main_menu())
+
+
+def _handle_callback(cfg, store, cq, awaiting, default_queries) -> None:
+    data = cq.get("data", "")
+    chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+    notifier.answer_callback(cq.get("id", ""))
+    if not chat_id:
+        return
+
+    if data == "show_new":
+        _do_show_new(cfg, store, chat_id, default_queries)
+    elif data == "set_keywords":
+        awaiting[chat_id] = True
+        notifier.send_message(
+            "✏️ Напиши ключевые слова через запятую.\n"
+            "Например: <i>проектирование, изыскания, обследование</i>",
+            chat_id=chat_id,
+        )
+    elif data == "my_keywords":
+        q = store.get_keywords(chat_id)
+        if q:
+            notifier.send_message(f"📋 Твои слова: <b>{', '.join(q)}</b>",
+                                  chat_id=chat_id, reply_markup=_main_menu())
+        else:
+            notifier.send_message(
+                f"У тебя слова по умолчанию: <b>{', '.join(default_queries)}</b>",
+                chat_id=chat_id, reply_markup=_main_menu())
+    elif data == "reset_keywords":
+        store.set_keywords(chat_id, [])
+        notifier.send_message(
+            f"🔔 Вернул слова по умолчанию: <b>{', '.join(default_queries)}</b>",
+            chat_id=chat_id, reply_markup=_main_menu())
+    elif data == "unsubscribe":
+        store.deactivate_user(chat_id)
+        notifier.send_message("⏸ Отписал тебя. Вернуться — команда /start", chat_id=chat_id)
+
+
+def cmd_bot(cfg: dict) -> None:
+    """Многопользовательский режим: у каждого свои слова, кнопки, автопроверка."""
+    interval = int(cfg.get("schedule", {}).get("interval_minutes", 30)) * 60
+    default_queries = cfg.get("source", {}).get("search_queries", [])
+    store = _open_store(cfg)
+    awaiting: dict[str, bool] = {}
     last_run = 0.0
     offset: int | None = None
 
+    log.info("Запуск многопользовательского бота, автопроверка каждые %d мин", interval // 60)
+
     while True:
-        # Периодическая автопроверка
+        # Периодическая автопроверка по всем активным пользователям
         if time.time() - last_run >= interval:
             try:
-                run_cycle(cfg)
+                users = store.list_active_users()
+                if users:
+                    session = scraper.build_logged_session()
+                    for uid in users:
+                        try:
+                            queries = store.get_keywords(uid) or default_queries
+                            process_for_user(cfg, store, session, uid, queries)
+                        except Exception:
+                            log.exception("Ошибка автоцикла для %s", uid)
             except Exception:
-                log.exception("Ошибка автоцикла — продолжаем работу")
+                log.exception("Ошибка автоцикла")
             last_run = time.time()
 
-        # Слушаем команды из Telegram (long polling)
+        # Слушаем команды/кнопки
         updates = notifier.get_updates(offset, timeout=30)
         for upd in updates:
             offset = upd["update_id"] + 1
-            msg = upd.get("message") or {}
-            text = (msg.get("text") or "").strip()
-            from_chat = str(msg.get("chat", {}).get("id", ""))
-
-            # Реагируем только на свой чат
-            if chat_id and from_chat != chat_id:
-                continue
-
-            if text.startswith("/new") or text.startswith("/start"):
-                try:
-                    notifier.send_message("🔍 Проверяю сайт, подожди…")
-                    sent = run_cycle(cfg)
-                    last_run = time.time()
-                    if sent == 0:
-                        notifier.send_message("✅ Новых тендеров нет.")
-                    else:
-                        notifier.send_message(f"✅ Готово, отправил {sent} шт.")
-                except Exception as e:
-                    log.exception("Ошибка обработки /new")
-                    try:
-                        notifier.send_message(f"⚠️ Ошибка: {e}")
-                    except notifier.TelegramError:
-                        pass
-            elif text.startswith("/help"):
-                notifier.send_message(
-                    "Команды:\n"
-                    "/new — получить свежие тендеры прямо сейчас\n"
-                    "/help — эта справка\n\n"
-                    f"Бот и сам проверяет сайт каждые {interval // 60} мин "
-                    "и присылает только новые объявления."
-                )
+            try:
+                if "callback_query" in upd:
+                    _handle_callback(cfg, store, upd["callback_query"], awaiting, default_queries)
+                elif "message" in upd:
+                    _handle_message(cfg, store, upd["message"], awaiting, default_queries)
+            except Exception:
+                log.exception("Ошибка обработки обновления")
 
 
 def main() -> None:
