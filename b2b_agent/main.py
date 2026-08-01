@@ -56,6 +56,7 @@ def run_cycle(cfg: dict) -> int:
             market_url=src.get("market_url", "https://www.b2b-center.ru/market/"),
             pages=int(src.get("pages", 1)),
             request_delay=float(src.get("request_delay", 3)),
+            search_queries=src.get("search_queries", []),
         )
         log.info("Собрано объявлений: %d", len(listings))
 

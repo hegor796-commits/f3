@@ -1,4 +1,10 @@
-"""Парсер списка торговых процедур B2B-Center через JSON API."""
+"""Парсер результатов поиска торгов B2B-Center (классический поиск по f_keyword).
+
+Логинимся по логину/паролю, затем для каждого поискового запроса из конфига
+запрашиваем страницу поиска /market/?f_keyword=... и разбираем HTML-таблицу
+результатов. Слово(а) поиска задаются в config.yaml, поэтому сменить интересы
+(проектирование → строительство и т.п.) можно без правки кода.
+"""
 
 import logging
 import os
@@ -7,27 +13,26 @@ import time
 from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup, NavigableString
 
 from .models import Listing
 
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.b2b-center.ru"
-API_URL = "https://www.b2b-center.ru/site/api/v1/market_for_me/main_page/participant/"
+SEARCH_URL = "https://www.b2b-center.ru/market/"
 LOGIN_URL = "https://www.b2b-center.ru/auth/credentials_ajax_login.html"
 AUTH_URL = "https://www.b2b-center.ru/auth/openid/authorize/"
-TOKEN_URL = "https://www.b2b-center.ru/auth/openid/token/"
 CLIENT_ID = "5d438a01-eda7-4a88-9a68-a21f3ce3d4b0"
-VIEW_LINK_RE = re.compile(r"/market/view\.html\?id=(\d+)|/app/market/.+/tender-(\d+)/")
+ID_RE = re.compile(r"/market/view\.html\?id=(\d+)|/tender-(\d+)/")
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
-    "Referer": "https://www.b2b-center.ru/app/next/main/",
 }
 
 
@@ -38,7 +43,6 @@ class ScrapeError(Exception):
 def _login(session: requests.Session, login: str, password: str) -> bool:
     """Авторизуется на сайте через логин и пароль."""
     try:
-        # Шаг 1: получаем страницу логина чтобы забрать CSRF токен
         auth_params = {
             "client_id": CLIENT_ID,
             "redirect_uri": "https://www.b2b-center.ru/app/next/main/",
@@ -51,7 +55,6 @@ def _login(session: requests.Session, login: str, password: str) -> bool:
             "Accept": "text/html,application/xhtml+xml",
         }, timeout=30)
 
-        # Ищем CSRF токен в HTML (между name и value могут быть другие атрибуты)
         csrf_match = re.search(r'name="login_form\[CSRFToken\]"[^>]*?value="([^"]+)"', resp.text)
         mfp_match = re.search(r'name="login_form\[MFPToken\]"[^>]*?value="([^"]+)"', resp.text)
 
@@ -59,14 +62,10 @@ def _login(session: requests.Session, login: str, password: str) -> bool:
             log.warning("CSRF токен не найден на странице входа")
             return False
 
-        csrf_token = csrf_match.group(1)
-        mfp_token = mfp_match.group(1) if mfp_match else ""
-
-        # Шаг 2: отправляем логин и пароль
         login_data = {
-            "login_form[CSRFToken]": csrf_token,
+            "login_form[CSRFToken]": csrf_match.group(1),
             "login_form[location_form]": "form_with_error_page",
-            "login_form[MFPToken]": mfp_token,
+            "login_form[MFPToken]": mfp_match.group(1) if mfp_match else "",
             "login_form[login]": login,
             "login_form[password]": password,
         }
@@ -77,149 +76,134 @@ def _login(session: requests.Session, login: str, password: str) -> bool:
             "Referer": resp.url,
         }, timeout=30)
 
-        result = login_resp.json()
-        if result.get("status") == "ok" or result.get("redirect"):
-            log.info("Авторизация на B2B-Center успешна")
+        # Успешный вход подтверждаем по наличию сессионной куки
+        if session.cookies.get("PHPSESSID") or login_resp.ok:
+            log.info("Авторизация на B2B-Center выполнена")
             return True
-        else:
-            log.warning("Ошибка авторизации: %s", result)
-            return False
+        return False
 
     except Exception as e:
         log.warning("Ошибка при авторизации: %s", e)
         return False
 
 
-def _get_access_token(session: requests.Session) -> str | None:
-    """Получает access_token через silent auth после логина."""
-    try:
-        params = {
-            "client_id": CLIENT_ID,
-            "redirect_uri": "https://www.b2b-center.ru/app/next/silent-auth/",
-            "response_type": "code",
-            "scope": "openid",
-            "prompt": "none",
-        }
-        resp = session.get(AUTH_URL, params=params, headers={
-            "User-Agent": HEADERS["User-Agent"],
-            "Accept": "text/html,application/xhtml+xml",
-        }, allow_redirects=False, timeout=15)
-
-        location = resp.headers.get("Location", "")
-        code_match = re.search(r"[?&]code=([^&]+)", location)
-        if not code_match:
-            log.warning("Не удалось получить code: %s", location[:200])
-            return None
-
-        code = code_match.group(1)
-
-        token_resp = session.post(TOKEN_URL, data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": "https://www.b2b-center.ru/app/next/silent-auth/",
-            "client_id": CLIENT_ID,
-        }, headers={
-            "User-Agent": HEADERS["User-Agent"],
-            "Content-Type": "application/x-www-form-urlencoded",
-        }, timeout=15)
-
-        token = token_resp.json().get("access_token")
-        if token:
-            log.info("Bearer токен успешно получен")
-        return token
-
-    except Exception as e:
-        log.warning("Ошибка получения токена: %s", e)
-        return None
-
-
 def _extract_id(url: str) -> str | None:
-    m = VIEW_LINK_RE.search(url)
+    m = ID_RE.search(url)
     if m:
         return m.group(1) or m.group(2)
     return None
 
 
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+
+def _parse_search_page(html: str) -> list[Listing]:
+    """Разбирает страницу результатов поиска. Каждый тендер — ссылка с data-lot_id."""
+    soup = BeautifulSoup(html, "html.parser")
+    listings: list[Listing] = []
+
+    for a in soup.select("a[data-lot_id]"):
+        href = (a.get("href") or "").split("#")[0]
+        listing_id = a.get("data-lot_id") or _extract_id(href)
+        if not listing_id or not href:
+            continue
+
+        url = urljoin(BASE_URL, href)
+
+        # Блок с описанием и компанией
+        desc_div = a.find("div", class_="search-results-title-desc")
+        description = ""
+        company = ""
+        if desc_div:
+            company_div = desc_div.find("div")
+            if company_div:
+                comp_text = _clean(company_div.get_text(" ", strip=True))
+                # Убираем ведущий номер тендера
+                company = re.sub(r"^\d+\s*", "", comp_text)
+                company_div.extract()
+            description = _clean(desc_div.get_text(" ", strip=True))
+
+        # Заголовок — прямой текст ссылки (до вложенных блоков)
+        title_parts = [c for c in a.contents if isinstance(c, NavigableString)]
+        title = _clean(" ".join(title_parts)) or f"Тендер {listing_id}"
+
+        listings.append(
+            Listing(
+                listing_id=str(listing_id),
+                title=title,
+                url=url,
+                company=company[:200],
+                description=description,
+            )
+        )
+
+    return listings
+
+
 def scrape_market(
-    market_url: str,
-    pages: int = 1,
+    market_url: str = SEARCH_URL,
+    pages: int = 3,
     request_delay: float = 3.0,
+    search_queries: list[str] | None = None,
 ) -> list[Listing]:
+    """Ищет торги по каждому слову из search_queries и собирает результаты."""
     session = requests.Session()
 
-    # Авторизуемся через логин/пароль
     login = os.environ.get("B2B_LOGIN", "")
     password = os.environ.get("B2B_PASSWORD", "")
-
     if login and password:
         _login(session, login, password)
     else:
-        log.warning("B2B_LOGIN или B2B_PASSWORD не заданы — работаем без авторизации")
+        log.warning("B2B_LOGIN или B2B_PASSWORD не заданы — авторизация пропущена")
 
-    # Получаем Bearer токен
-    token = _get_access_token(session)
-    if not token:
-        log.warning("Bearer токен недоступен — запросы могут вернуть 401")
-
-    api_headers = {**HEADERS}
-    if token:
-        api_headers["Authorization"] = f"Bearer {token}"
+    queries = [q for q in (search_queries or []) if q.strip()]
+    if not queries:
+        log.warning("Не заданы слова для поиска (search_queries) — нечего искать")
+        return []
 
     all_listings: list[Listing] = []
     seen_ids: set[str] = set()
 
-    for page in range(pages):
-        params = {
-            "page": page + 1,
-            "page_size": 20,
-            "buy_sell": "buy",
-        }
-        try:
-            resp = session.get(API_URL, headers=api_headers, params=params, timeout=30)
-            if resp.status_code != 200:
-                log.warning("API вернул статус %d на странице %d", resp.status_code, page + 1)
+    for query in queries:
+        for page in range(pages):
+            params = {
+                "f_keyword": query,
+                "search_type": "2",
+                "price_currency": "0",
+                "date": "1",
+                "trade": "all",
+            }
+            if page > 0:
+                params["page"] = page + 1
+
+            try:
+                resp = session.get(SEARCH_URL, params=params, headers=HEADERS, timeout=30)
+                if resp.status_code != 200:
+                    log.warning("Поиск '%s' стр.%d: HTTP %d", query, page + 1, resp.status_code)
+                    break
+            except requests.RequestException as e:
+                log.warning("Поиск '%s' стр.%d: ошибка сети %s", query, page + 1, e)
                 break
-            data = resp.json()
-        except Exception as e:
-            log.warning("Ошибка запроса к API на странице %d: %s", page + 1, e)
-            break
 
-        trades = data.get("trades", [])
-        if not trades:
-            log.warning("API вернул пустой список торгов на странице %d", page + 1)
-            break
+            page_listings = _parse_search_page(resp.text)
+            if not page_listings:
+                if page == 0:
+                    log.warning("Поиск '%s': ничего не найдено", query)
+                break
 
-        new_count = 0
-        for trade in trades:
-            url = trade.get("url", "")
-            listing_id = _extract_id(url)
-            if not listing_id:
-                listing_id = str(trade.get("sphinx_id", ""))
-            if not listing_id or listing_id in seen_ids:
-                continue
-            seen_ids.add(listing_id)
+            new_count = 0
+            for lst in page_listings:
+                if lst.listing_id not in seen_ids:
+                    seen_ids.add(lst.listing_id)
+                    all_listings.append(lst)
+                    new_count += 1
+            log.info("Поиск '%s' стр.%d: %d найдено (%d новых)",
+                     query, page + 1, len(page_listings), new_count)
 
-            full_url = urljoin(BASE_URL, url) if url.startswith("/") else url
-            title = re.sub(r"&nbsp;?", " ", trade.get("title", "")).strip()
-            description = re.sub(r"&nbsp;?", " ", trade.get("description", "")).strip()
-            company = trade.get("org_name_short", "")
-            end_date = trade.get("date_actual", "")
+            if new_count == 0:
+                break  # дальше только повторы — след. страница не нужна
 
-            all_listings.append(
-                Listing(
-                    listing_id=listing_id,
-                    title=title,
-                    url=full_url,
-                    company=company,
-                    end_date=end_date,
-                    description=description,
-                )
-            )
-            new_count += 1
-
-        log.info("Страница %d: %d объявлений (%d новых)", page + 1, len(trades), new_count)
-
-        if page < pages - 1:
             time.sleep(request_delay)
 
     return all_listings
