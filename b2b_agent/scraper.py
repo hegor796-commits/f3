@@ -99,30 +99,37 @@ def _clean(text: str) -> str:
 
 
 def _parse_search_page(html: str) -> list[Listing]:
-    """Разбирает страницу результатов поиска. Каждый тендер — ссылка с data-lot_id."""
+    """Разбирает страницу результатов поиска.
+
+    У каждого результата есть блок <div class="search-results-title-desc">
+    внутри ссылки на карточку торга — по нему их и находим (надёжнее, чем
+    по конкретному атрибуту).
+    """
     soup = BeautifulSoup(html, "html.parser")
     listings: list[Listing] = []
+    seen: set[str] = set()
 
-    for a in soup.select("a[data-lot_id]"):
+    for desc_div in soup.find_all("div", class_="search-results-title-desc"):
+        a = desc_div.find_parent("a")
+        if not a:
+            continue
+
         href = (a.get("href") or "").split("#")[0]
         listing_id = a.get("data-lot_id") or _extract_id(href)
-        if not listing_id or not href:
+        if not listing_id or not href or str(listing_id) in seen:
             continue
+        seen.add(str(listing_id))
 
         url = urljoin(BASE_URL, href)
 
-        # Блок с описанием и компанией
-        desc_div = a.find("div", class_="search-results-title-desc")
-        description = ""
+        # Компания — во вложенном div внутри блока описания
         company = ""
-        if desc_div:
-            company_div = desc_div.find("div")
-            if company_div:
-                comp_text = _clean(company_div.get_text(" ", strip=True))
-                # Убираем ведущий номер тендера
-                company = re.sub(r"^\d+\s*", "", comp_text)
-                company_div.extract()
-            description = _clean(desc_div.get_text(" ", strip=True))
+        company_div = desc_div.find("div")
+        if company_div:
+            comp_text = _clean(company_div.get_text(" ", strip=True))
+            company = re.sub(r"^\d+\s*", "", comp_text)  # убрать ведущий номер
+            company_div.extract()
+        description = _clean(desc_div.get_text(" ", strip=True))
 
         # Заголовок — прямой текст ссылки (до вложенных блоков)
         title_parts = [c for c in a.contents if isinstance(c, NavigableString)]
