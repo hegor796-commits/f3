@@ -135,6 +135,10 @@ def _parse_search_page(html: str) -> list[Listing]:
         title_parts = [c for c in a.contents if isinstance(c, NavigableString)]
         title = _clean(" ".join(title_parts)) or f"Тендер {listing_id}"
 
+        # Текст всей строки результата — для определения региона (Москва и т.п.)
+        row = a.find_parent("tr")
+        row_text = _clean(row.get_text(" ", strip=True)) if row else f"{title} {company} {description}"
+
         listings.append(
             Listing(
                 listing_id=str(listing_id),
@@ -142,10 +146,43 @@ def _parse_search_page(html: str) -> list[Listing]:
                 url=url,
                 company=company[:200],
                 description=description,
+                extra={"row": row_text.lower()},
             )
         )
 
     return listings
+
+
+def is_moscow(lst: Listing) -> bool:
+    """Относится ли тендер к Москве/Московской области (по тексту строки)."""
+    text = (lst.extra.get("row", "") + " " + lst.company + " " + lst.description).lower()
+    return "москва" in text or "московск" in text or "г. москва" in text
+
+
+def search_template(
+    session: requests.Session,
+    template: dict,
+    pages: int = 1,
+    request_delay: float = 3.0,
+) -> list[Listing]:
+    """Поиск по одному шаблону: слова + гео-фильтр + исключения."""
+    results = search_listings(session, template.get("keywords", []), pages, request_delay)
+
+    # Гео: для шаблона стройки оставляем только Москву
+    if template.get("geo") == "moscow":
+        results = [r for r in results if is_moscow(r)]
+
+    # Исключения: отбрасываем всё, где встретилось слово-исключение
+    excludes = [e.lower() for e in template.get("exclusions", []) if e.strip()]
+    if excludes:
+        filtered = []
+        for r in results:
+            hay = (r.extra.get("row", "") + " " + r.title + " " + r.description).lower()
+            if not any(ex in hay for ex in excludes):
+                filtered.append(r)
+        results = filtered
+
+    return results
 
 
 def build_logged_session() -> requests.Session:

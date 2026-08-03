@@ -13,6 +13,7 @@ class Listing:
     company: str = ""
     end_date: str = ""
     description: str = ""
+    region: str = ""
     extra: dict = field(default_factory=dict)
 
     # Заполняется на этапе ИИ-оценки

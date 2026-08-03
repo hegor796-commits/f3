@@ -48,51 +48,70 @@ def _open_store(cfg: dict) -> Store:
     return Store(db_path)
 
 
-def process_for_user(
-    cfg: dict,
-    store: Store,
-    session,
-    chat_id: str,
-    queries: list[str],
-) -> int:
-    """Ищет тендеры по словам пользователя, шлёт ему новые. Возвращает число отправленных."""
+# Стартовые шаблоны поиска (создаются один раз в пустой базе)
+TEMPLATE_DEFS = [
+    {
+        "name": "proekt",
+        "title": "📐 Проектирование",
+        "geo": "all",
+        "keywords": [
+            "разработка проектной документации",
+            "ПСД",
+            "разработка рабочей документации",
+            "проект",
+            "функции генерального проектировщика",
+        ],
+        "exclusions": [],
+    },
+    {
+        "name": "stroy",
+        "title": "🏗 Строительство (Москва)",
+        "geo": "moscow",
+        "keywords": [
+            "СМР",
+            "строительно-монтажные работы",
+            "строительство",
+            "монтажные работы",
+        ],
+        "exclusions": [],
+    },
+]
+
+
+def _init_templates(store: Store) -> None:
+    for t in TEMPLATE_DEFS:
+        store.ensure_template(t["name"], t["title"], t["keywords"], t["exclusions"], t["geo"])
+
+
+def process_for_user(cfg: dict, store: Store, session, chat_id: str) -> int:
+    """Ищет тендеры по ВСЕМ шаблонам, шлёт пользователю новые. Возвращает число отправленных."""
     src = cfg.get("source", {})
     ai_cfg = cfg.get("ai", {})
     parse_mode = cfg.get("telegram", {}).get("parse_mode", "HTML")
+    pages = int(src.get("pages", 1))
+    delay = float(src.get("request_delay", 3))
 
-    listings = scraper.search_listings(
-        session,
-        queries,
-        pages=int(src.get("pages", 1)),
-        request_delay=float(src.get("request_delay", 3)),
-    )
+    # Собираем результаты из всех шаблонов (гео и исключения применяются внутри)
+    collected: dict[str, object] = {}
+    for tpl in store.all_templates():
+        for lst in scraper.search_template(session, tpl, pages, delay):
+            collected.setdefault(lst.listing_id, lst)
+    listings = list(collected.values())
 
-    # Только те, что этому пользователю ещё не слали
     fresh = [lst for lst in listings if not store.is_seen(chat_id, lst.listing_id)]
 
-    # Отсеиваем слова-исключения (сам поиск на сайте уже отобрал по словам)
-    excludes = [e.lower() for e in cfg.get("exclude_keywords", []) if e.strip()]
-    matched = []
-    for lst in fresh:
-        haystack = f"{lst.title} {lst.company} {lst.description}".lower()
-        if any(ex in haystack for ex in excludes):
-            store.mark_seen(chat_id, lst.listing_id, lst.title)
-            continue
-        lst.matched_keywords = queries
-        matched.append(lst)
-
-    # ИИ-оценка (если доступна)
-    to_notify = matched
-    if matched and ai_cfg.get("enabled", True) and ai_filter.is_available():
+    # ИИ-оценка (если доступна; сейчас OpenAI блокирует РФ, поэтому обычно пропускается)
+    to_notify = fresh
+    if fresh and ai_cfg.get("enabled", True) and ai_filter.is_available():
         min_score = int(ai_cfg.get("min_score", 6))
         ai_filter.check_relevance(
-            matched,
+            fresh,
             interest_profile=ai_cfg.get("interest_profile", ""),
             model=ai_cfg.get("model", "gpt-4o"),
             max_checks=int(ai_cfg.get("max_checks_per_cycle", 20)),
         )
-        to_notify = [l for l in matched if l.ai_score is None or l.ai_score >= min_score]
-        for l in matched:
+        to_notify = [l for l in fresh if l.ai_score is None or l.ai_score >= min_score]
+        for l in fresh:
             if l not in to_notify:
                 store.mark_seen(chat_id, l.listing_id, l.title)
 
@@ -113,13 +132,13 @@ def process_for_user(
 
 
 def run_cycle(cfg: dict) -> int:
-    """Один цикл для режимов once/run — по chat_id из .env и словам из конфига."""
+    """Один цикл для режимов once/run — по chat_id из .env и всем шаблонам."""
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    queries = cfg.get("source", {}).get("search_queries", [])
     store = _open_store(cfg)
     try:
+        _init_templates(store)
         session = scraper.build_logged_session()
-        return process_for_user(cfg, store, session, chat_id, queries)
+        return process_for_user(cfg, store, session, chat_id)
     finally:
         store.close()
 
@@ -148,67 +167,112 @@ def cmd_get_chat_id() -> None:
         print("\nВыбери нужный chat_id и запиши его в .env как TELEGRAM_CHAT_ID")
 
 
-def _main_menu() -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "🔍 Показать новые тендеры", "callback_data": "show_new"}],
-            [{"text": "✏️ Задать слова поиска", "callback_data": "set_keywords"}],
-            [{"text": "📋 Мои слова", "callback_data": "my_keywords"}],
-            [{"text": "🔔 Слова по умолчанию", "callback_data": "reset_keywords"}],
-            [{"text": "⏸ Отписаться", "callback_data": "unsubscribe"}],
-        ]
-    }
-
-
 WELCOME = (
     "🤖 <b>Бот мониторинга тендеров B2B-Center</b>\n\n"
-    "Я каждые 30 минут ищу новые тендеры и присылаю тебе (без повторов).\n\n"
-    "По умолчанию ищу по словам, заданным администратором. Хочешь свои — "
-    "нажми «✏️ Задать слова поиска» и напиши их через запятую.\n\n"
+    "Я каждые 30 минут ищу новые тендеры по двум шаблонам и присылаю тебе "
+    "(без повторов):\n"
+    "• 📐 <b>Проектирование</b> — по всей стране\n"
+    "• 🏗 <b>Строительство</b> — только по Москве\n\n"
+    "Нажми «Показать новые», чтобы проверить прямо сейчас, или зайди в шаблон "
+    "чтобы добавить/убрать ключевые слова и исключения.\n\n"
     "Выбери действие:"
 )
 
 
-def _do_show_new(cfg: dict, store: Store, chat_id: str, default_queries: list[str]) -> None:
+def _main_menu() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "🔍 Показать новые тендеры", "callback_data": "new"}],
+            [{"text": "📐 Шаблон проектирования", "callback_data": "tpl:proekt"}],
+            [{"text": "🏗 Шаблон строительства", "callback_data": "tpl:stroy"}],
+        ]
+    }
+
+
+def _template_menu(name: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "➕ Добавить ключевое слово", "callback_data": f"addkw:{name}"}],
+            [{"text": "🚫 Добавить исключение", "callback_data": f"addex:{name}"}],
+            [{"text": "➖ Убрать ключевое слово", "callback_data": f"rmkw:{name}"}],
+            [{"text": "➖ Убрать исключение", "callback_data": f"rmex:{name}"}],
+            [{"text": "⬅️ В главное меню", "callback_data": "menu"}],
+        ]
+    }
+
+
+def _removal_menu(name: str, items: list[str], kind: str) -> dict:
+    rows = [
+        [{"text": f"❌ {w[:45]}", "callback_data": f"del{kind}:{name}:{i}"}]
+        for i, w in enumerate(items)
+    ]
+    rows.append([{"text": "⬅️ Назад", "callback_data": f"tpl:{name}"}])
+    return {"inline_keyboard": rows}
+
+
+def _template_text(tpl: dict) -> str:
+    kw = "\n".join(f"• {w}" for w in tpl["keywords"]) or "—"
+    ex = "\n".join(f"• {w}" for w in tpl["exclusions"]) or "—"
+    geo = "только Москва" if tpl["geo"] == "moscow" else "вся страна"
+    return (
+        f"<b>{tpl['title']}</b>\n"
+        f"🌍 Гео: {geo}\n\n"
+        f"🔑 <b>Ключевые слова:</b>\n{kw}\n\n"
+        f"🚫 <b>Исключения:</b>\n{ex}"
+    )
+
+
+def _show_template(store: Store, chat_id: str, name: str) -> None:
+    tpl = store.get_template(name)
+    if not tpl:
+        notifier.send_message("Шаблон не найден.", chat_id=chat_id, reply_markup=_main_menu())
+        return
+    notifier.send_message(_template_text(tpl), chat_id=chat_id, reply_markup=_template_menu(name))
+
+
+def _do_show_new(cfg: dict, store: Store, chat_id: str) -> None:
     store.add_user(chat_id)
-    queries = store.get_keywords(chat_id) or default_queries
     try:
         notifier.send_message("🔍 Проверяю сайт, подожди…", chat_id=chat_id)
         session = scraper.build_logged_session()
-        sent = process_for_user(cfg, store, session, chat_id, queries)
+        sent = process_for_user(cfg, store, session, chat_id)
         tail = f"✅ Готово, отправил {sent} шт." if sent else "✅ Новых тендеров нет."
         notifier.send_message(tail, chat_id=chat_id, reply_markup=_main_menu())
     except Exception as e:
         log.exception("Ошибка show_new для %s", chat_id)
-        notifier.send_message(f"⚠️ Ошибка: {e}", chat_id=chat_id)
+        notifier.send_message(f"⚠️ Ошибка: {e}", chat_id=chat_id, reply_markup=_main_menu())
 
 
-def _handle_message(cfg, store, msg, awaiting, default_queries) -> None:
+def _handle_message(cfg, store, msg, awaiting) -> None:
     text = (msg.get("text") or "").strip()
     chat_id = str(msg.get("chat", {}).get("id", ""))
     if not chat_id:
         return
 
-    # Пользователь вводит свои ключевые слова
-    if awaiting.pop(chat_id, False):
+    # Пользователь вводит слово для добавления в шаблон
+    pending = awaiting.pop(chat_id, None)
+    if pending:
+        action, name = pending
         words = [w.strip() for w in re.split(r"[,\n;]+", text) if w.strip()]
-        if words:
-            store.set_keywords(chat_id, words)
-            notifier.send_message(
-                f"✅ Буду искать по словам: <b>{', '.join(words)}</b>",
-                chat_id=chat_id,
-            )
-            _do_show_new(cfg, store, chat_id, default_queries)
-        else:
+        if not words:
             notifier.send_message("Не понял слова, попробуй ещё раз.", chat_id=chat_id,
-                                  reply_markup=_main_menu())
+                                  reply_markup=_template_menu(name))
+            return
+        for w in words:
+            if action == "addkw":
+                store.add_keyword(name, w)
+            else:
+                store.add_exclusion(name, w)
+        what = "ключевые слова" if action == "addkw" else "исключения"
+        notifier.send_message(f"✅ Добавил в {what}: <b>{', '.join(words)}</b>", chat_id=chat_id)
+        _show_template(store, chat_id, name)
         return
 
     if text.startswith("/start"):
         store.add_user(chat_id)
         notifier.send_message(WELCOME, chat_id=chat_id, reply_markup=_main_menu())
     elif text.startswith("/new"):
-        _do_show_new(cfg, store, chat_id, default_queries)
+        _do_show_new(cfg, store, chat_id)
     elif text.startswith("/help"):
         notifier.send_message(WELCOME, chat_id=chat_id, reply_markup=_main_menu())
     else:
@@ -216,54 +280,78 @@ def _handle_message(cfg, store, msg, awaiting, default_queries) -> None:
         notifier.send_message("Выбери действие:", chat_id=chat_id, reply_markup=_main_menu())
 
 
-def _handle_callback(cfg, store, cq, awaiting, default_queries) -> None:
+def _handle_callback(cfg, store, cq, awaiting) -> None:
     data = cq.get("data", "")
     chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
     notifier.answer_callback(cq.get("id", ""))
     if not chat_id:
         return
 
-    if data == "show_new":
-        _do_show_new(cfg, store, chat_id, default_queries)
-    elif data == "set_keywords":
-        awaiting[chat_id] = True
+    store.add_user(chat_id)
+
+    if data == "menu":
+        notifier.send_message("Главное меню:", chat_id=chat_id, reply_markup=_main_menu())
+    elif data == "new":
+        _do_show_new(cfg, store, chat_id)
+    elif data.startswith("tpl:"):
+        _show_template(store, chat_id, data.split(":", 1)[1])
+    elif data.startswith("addkw:"):
+        name = data.split(":", 1)[1]
+        awaiting[chat_id] = ("addkw", name)
         notifier.send_message(
-            "✏️ Напиши ключевые слова через запятую.\n"
-            "Например: <i>проектирование, изыскания, обследование</i>",
-            chat_id=chat_id,
-        )
-    elif data == "my_keywords":
-        q = store.get_keywords(chat_id)
-        if q:
-            notifier.send_message(f"📋 Твои слова: <b>{', '.join(q)}</b>",
-                                  chat_id=chat_id, reply_markup=_main_menu())
+            "➕ Напиши ключевое слово (или несколько через запятую), "
+            "которое добавить в поиск:", chat_id=chat_id)
+    elif data.startswith("addex:"):
+        name = data.split(":", 1)[1]
+        awaiting[chat_id] = ("addex", name)
+        notifier.send_message(
+            "🚫 Напиши слово-исключение (или несколько через запятую). "
+            "Тендеры с этим словом присылаться не будут:", chat_id=chat_id)
+    elif data.startswith("rmkw:"):
+        name = data.split(":", 1)[1]
+        tpl = store.get_template(name)
+        if tpl and tpl["keywords"]:
+            notifier.send_message("Выбери слово для удаления:", chat_id=chat_id,
+                                  reply_markup=_removal_menu(name, tpl["keywords"], "kw"))
         else:
-            notifier.send_message(
-                f"У тебя слова по умолчанию: <b>{', '.join(default_queries)}</b>",
-                chat_id=chat_id, reply_markup=_main_menu())
-    elif data == "reset_keywords":
-        store.set_keywords(chat_id, [])
-        notifier.send_message(
-            f"🔔 Вернул слова по умолчанию: <b>{', '.join(default_queries)}</b>",
-            chat_id=chat_id, reply_markup=_main_menu())
-    elif data == "unsubscribe":
-        store.deactivate_user(chat_id)
-        notifier.send_message("⏸ Отписал тебя. Вернуться — команда /start", chat_id=chat_id)
+            notifier.send_message("Список ключевых слов пуст.", chat_id=chat_id,
+                                  reply_markup=_template_menu(name))
+    elif data.startswith("rmex:"):
+        name = data.split(":", 1)[1]
+        tpl = store.get_template(name)
+        if tpl and tpl["exclusions"]:
+            notifier.send_message("Выбери исключение для удаления:", chat_id=chat_id,
+                                  reply_markup=_removal_menu(name, tpl["exclusions"], "ex"))
+        else:
+            notifier.send_message("Список исключений пуст.", chat_id=chat_id,
+                                  reply_markup=_template_menu(name))
+    elif data.startswith("delkw:"):
+        _, name, idx = data.split(":", 2)
+        removed = store.remove_keyword(name, int(idx))
+        if removed:
+            notifier.send_message(f"➖ Убрал ключевое слово: <b>{removed}</b>", chat_id=chat_id)
+        _show_template(store, chat_id, name)
+    elif data.startswith("delex:"):
+        _, name, idx = data.split(":", 2)
+        removed = store.remove_exclusion(name, int(idx))
+        if removed:
+            notifier.send_message(f"➖ Убрал исключение: <b>{removed}</b>", chat_id=chat_id)
+        _show_template(store, chat_id, name)
 
 
 def cmd_bot(cfg: dict) -> None:
-    """Многопользовательский режим: у каждого свои слова, кнопки, автопроверка."""
+    """Многопользовательский режим с шаблонами (проектирование / строительство)."""
     interval = int(cfg.get("schedule", {}).get("interval_minutes", 30)) * 60
-    default_queries = cfg.get("source", {}).get("search_queries", [])
     store = _open_store(cfg)
-    awaiting: dict[str, bool] = {}
-    last_run = 0.0
+    _init_templates(store)
+    awaiting: dict[str, tuple] = {}
+    # Сразу отвечаем на команды; первая автопроверка — через interval (не блокируем старт)
+    last_run = time.time()
     offset: int | None = None
 
-    log.info("Запуск многопользовательского бота, автопроверка каждые %d мин", interval // 60)
+    log.info("Запуск бота с шаблонами, автопроверка каждые %d мин", interval // 60)
 
     while True:
-        # Периодическая автопроверка по всем активным пользователям
         if time.time() - last_run >= interval:
             try:
                 users = store.list_active_users()
@@ -271,23 +359,21 @@ def cmd_bot(cfg: dict) -> None:
                     session = scraper.build_logged_session()
                     for uid in users:
                         try:
-                            queries = store.get_keywords(uid) or default_queries
-                            process_for_user(cfg, store, session, uid, queries)
+                            process_for_user(cfg, store, session, uid)
                         except Exception:
                             log.exception("Ошибка автоцикла для %s", uid)
             except Exception:
                 log.exception("Ошибка автоцикла")
             last_run = time.time()
 
-        # Слушаем команды/кнопки
         updates = notifier.get_updates(offset, timeout=30)
         for upd in updates:
             offset = upd["update_id"] + 1
             try:
                 if "callback_query" in upd:
-                    _handle_callback(cfg, store, upd["callback_query"], awaiting, default_queries)
+                    _handle_callback(cfg, store, upd["callback_query"], awaiting)
                 elif "message" in upd:
-                    _handle_message(cfg, store, upd["message"], awaiting, default_queries)
+                    _handle_message(cfg, store, upd["message"], awaiting)
             except Exception:
                 log.exception("Ошибка обработки обновления")
 
